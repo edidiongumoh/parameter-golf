@@ -723,45 +723,31 @@ class SelectiveSSM(nn.Module):
         return self.out_proj(y)
 
     def _parallel_scan(self, x: Tensor, dt: Tensor, A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-        """Parallel-friendly selective scan using einsum. Avoids sequential loop entirely.
-
-        Instead of stepping through time, we compute the scan using a chunked
-        associative approach: process chunks of 64 timesteps, carry state between chunks.
-        Within each chunk, we unroll without storing full backprop graph.
-        """
+        """Chunked sequential scan with detach between chunks to limit memory."""
         bsz, seqlen, d = x.shape
-        n = self.state_dim
-        chunk_size = 64
-
-        x_f = x.float()
-        dt_f = dt.float()
-        B_f = B.float()
-        C_f = C.float()
+        chunk_size = 32  # small chunks to limit backprop graph
 
         y = torch.zeros(bsz, seqlen, d, device=x.device, dtype=x.dtype)
-        h = torch.zeros(bsz, d, n, device=x.device, dtype=torch.float32)
+        h = torch.zeros(bsz, d, self.state_dim, device=x.device, dtype=torch.float32)
 
         for chunk_start in range(0, seqlen, chunk_size):
             chunk_end = min(chunk_start + chunk_size, seqlen)
-            cs = chunk_end - chunk_start
 
-            # Slice this chunk
-            dt_chunk = dt_f[:, chunk_start:chunk_end, :]   # (B, cs, D)
-            x_chunk = x_f[:, chunk_start:chunk_end, :]     # (B, cs, D)
-            B_chunk = B_f[:, chunk_start:chunk_end, :]     # (B, cs, N)
-            C_chunk = C_f[:, chunk_start:chunk_end, :]     # (B, cs, N)
+            # Sequential within chunk (short — only 32 steps)
+            for t in range(chunk_start, chunk_end):
+                dt_t = dt[:, t, :].float()
+                x_t = x[:, t, :].float()
+                B_t = B[:, t, :].float()
+                C_t = C[:, t, :].float()
 
-            # Compute dA and dB for the whole chunk at once
-            dA_chunk = torch.exp(dt_chunk.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))  # (B, cs, D, N)
-            dB_chunk = dt_chunk.unsqueeze(-1) * B_chunk.unsqueeze(2)  # (B, cs, D, N)
-            x_dB = dB_chunk * x_chunk.unsqueeze(-1)  # (B, cs, D, N)
+                # Discretize: per-step to avoid materializing (B, cs, D, N) tensors
+                dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))  # (B, D, N)
+                dB_x = (dt_t.unsqueeze(-1) * B_t.unsqueeze(1)) * x_t.unsqueeze(-1)  # (B, D, N)
 
-            # Sequential within chunk (short — only 64 steps, manageable memory)
-            for t in range(cs):
-                h = dA_chunk[:, t] * h + x_dB[:, t]
-                y[:, chunk_start + t, :] = (h * C_chunk[:, t].unsqueeze(1)).sum(dim=-1).to(dtype=y.dtype)
+                h = dA * h + dB_x
+                y[:, t, :] = (h * C_t.unsqueeze(1)).sum(dim=-1).to(dtype=y.dtype)
 
-            # Detach h between chunks to limit backprop graph depth
+            # Detach between chunks to cap backprop graph at chunk_size steps
             h = h.detach()
 
         return y
