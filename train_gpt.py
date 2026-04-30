@@ -59,6 +59,14 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
+    # Sequence mixer: "attention" (default) or "ssm" (Mamba-style selective state space).
+    sequence_mixer = os.environ.get("SEQUENCE_MIXER", "attention").lower()
+    # SSM hyperparameters (only used when sequence_mixer="ssm").
+    ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 16))
+    ssm_expand = int(os.environ.get("SSM_EXPAND", 2))
+    ssm_dt_rank = os.environ.get("SSM_DT_RANK", "auto")  # "auto" = ceil(dim / 16)
+    ssm_conv_width = int(os.environ.get("SSM_CONV_WIDTH", 4))
+
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
@@ -617,6 +625,139 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+# -----------------------------
+# SELECTIVE STATE SPACE MODEL (Mamba-style)
+# -----------------------------
+#
+# A minimal selective SSM layer that replaces CausalSelfAttention.
+# Pure PyTorch implementation — no external mamba-ssm dependency.
+# Based on the Mamba architecture (Gu & Dao, 2023) with simplifications
+# for the parameter-golf setting: no complex number states, no hardware-aware scan.
+#
+# The selective scan is the key innovation: input-dependent Δ, B, C parameters
+# allow the model to selectively remember or forget information, unlike
+# fixed-parameter linear recurrences (S4, H3).
+
+class SelectiveSSM(nn.Module):
+    """Mamba-style selective state-space sequence mixer.
+
+    Replaces CausalSelfAttention as a drop-in sequence mixer in Block.
+    Interface: forward(x: Tensor) -> Tensor, where x is (batch, seq_len, dim).
+    """
+
+    def __init__(self, dim: int, state_dim: int = 16, expand: int = 2,
+                 dt_rank: int | str = "auto", conv_width: int = 4):
+        super().__init__()
+        self.dim = dim
+        self.state_dim = state_dim
+        self.expand = expand
+        self.inner_dim = dim * expand
+        self.dt_rank = math.ceil(dim / 16) if dt_rank == "auto" else int(dt_rank)
+        self.conv_width = conv_width
+
+        # Input projection: x -> (z, x_for_ssm) where z is the gate branch
+        self.in_proj = CastedLinear(dim, self.inner_dim * 2, bias=False)
+
+        # 1D depthwise conv on the SSM branch (causal, groups=inner_dim)
+        self.conv1d = nn.Conv1d(
+            self.inner_dim, self.inner_dim,
+            kernel_size=conv_width, padding=conv_width - 1,
+            groups=self.inner_dim, bias=True,
+        )
+
+        # SSM parameters projection: from inner_dim -> dt, B, C
+        # dt_rank for Δ, state_dim for B, state_dim for C
+        self.x_proj = CastedLinear(self.inner_dim, self.dt_rank + 2 * state_dim, bias=False)
+
+        # Δ (discretization step) projection: dt_rank -> inner_dim
+        self.dt_proj = nn.Linear(self.dt_rank, self.inner_dim, bias=True)
+        # Initialize dt bias to small positive values (log-uniform in [0.001, 0.1])
+        with torch.no_grad():
+            dt_init = torch.exp(torch.rand(self.inner_dim) * (math.log(0.1) - math.log(0.001)) + math.log(0.001))
+            inv_softplus = dt_init + torch.log(-torch.expm1(-dt_init))
+            self.dt_proj.bias.copy_(inv_softplus)
+
+        # A parameter (diagonal state matrix, learned in log space)
+        # Initialize as -log(1..state_dim) repeated across inner_dim
+        A = torch.arange(1, state_dim + 1, dtype=torch.float32).unsqueeze(0).expand(self.inner_dim, -1)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        # D parameter (skip connection, like a residual)
+        self.D = nn.Parameter(torch.ones(self.inner_dim))
+
+        # Output projection
+        self.out_proj = CastedLinear(self.inner_dim, dim, bias=False)
+        self.out_proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, _ = x.shape
+
+        # Input projection and split into SSM branch (xz[:inner_dim]) and gate (xz[inner_dim:])
+        xz = self.in_proj(x)
+        x_ssm, z = xz.split([self.inner_dim, self.inner_dim], dim=-1)
+
+        # Causal 1D conv
+        x_ssm = x_ssm.transpose(1, 2)  # (B, inner_dim, L)
+        x_ssm = self.conv1d(x_ssm)[:, :, :seqlen]  # causal: trim to original length
+        x_ssm = x_ssm.transpose(1, 2)  # (B, L, inner_dim)
+        x_ssm = F.silu(x_ssm)
+
+        # Compute input-dependent SSM parameters
+        x_dbl = self.x_proj(x_ssm)  # (B, L, dt_rank + 2*state_dim)
+        dt, B, C = x_dbl.split([self.dt_rank, self.state_dim, self.state_dim], dim=-1)
+        dt = self.dt_proj(dt)  # (B, L, inner_dim)
+        dt = F.softplus(dt)  # ensure positive
+
+        # Discretize: A_bar = exp(-dt * A), B_bar = dt * B
+        A = -torch.exp(self.A_log.float())  # (inner_dim, state_dim)
+
+        # Selective scan (sequential, pure PyTorch)
+        y = self._selective_scan(x_ssm, dt, A, B, C)
+
+        # Skip connection with D
+        y = y + x_ssm * self.D.to(dtype=x_ssm.dtype)[None, None, :]
+
+        # Gate with SiLU(z)
+        y = y * F.silu(z)
+
+        return self.out_proj(y)
+
+    def _selective_scan(self, x: Tensor, dt: Tensor, A: Tensor, B: Tensor, C: Tensor) -> Tensor:
+        """Sequential selective scan. x: (B, L, D), dt: (B, L, D), A: (D, N), B: (B, L, N), C: (B, L, N)."""
+        bsz, seqlen, d = x.shape
+        n = self.state_dim
+
+        # Cast to float32 for numerical stability in the recurrence
+        x = x.float()
+        dt = dt.float()
+        B = B.float()
+        C = C.float()
+
+        # Initialize hidden state
+        h = torch.zeros(bsz, d, n, device=x.device, dtype=torch.float32)
+        ys = []
+
+        for t in range(seqlen):
+            dt_t = dt[:, t, :]  # (B, D)
+            x_t = x[:, t, :]   # (B, D)
+            B_t = B[:, t, :]   # (B, N)
+            C_t = C[:, t, :]   # (B, N)
+
+            # Discretize at this timestep
+            dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))  # (B, D, N)
+            dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)           # (B, D, N)
+
+            # State update: h = A_bar * h + B_bar * x
+            h = dA * h + dB * x_t.unsqueeze(-1)
+
+            # Output: y = C * h
+            y_t = (h * C_t.unsqueeze(1)).sum(dim=-1)  # (B, D)
+            ys.append(y_t)
+
+        y = torch.stack(ys, dim=1)  # (B, L, D)
+        return y.to(dtype=self.out_proj.weight.dtype)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -626,11 +767,22 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        sequence_mixer: str = "attention",
+        ssm_state_dim: int = 16,
+        ssm_expand: int = 2,
+        ssm_dt_rank: int | str = "auto",
+        ssm_conv_width: int = 4,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        if sequence_mixer == "ssm":
+            self.attn = SelectiveSSM(
+                dim, state_dim=ssm_state_dim, expand=ssm_expand,
+                dt_rank=ssm_dt_rank, conv_width=ssm_conv_width,
+            )
+        else:
+            self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -659,6 +811,11 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        sequence_mixer: str = "attention",
+        ssm_state_dim: int = 16,
+        ssm_expand: int = 2,
+        ssm_dt_rank: int | str = "auto",
+        ssm_conv_width: int = 4,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,6 +837,11 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    sequence_mixer=sequence_mixer,
+                    ssm_state_dim=ssm_state_dim,
+                    ssm_expand=ssm_expand,
+                    ssm_dt_rank=ssm_dt_rank,
+                    ssm_conv_width=ssm_conv_width,
                 )
                 for i in range(num_layers)
             ]
@@ -835,12 +997,19 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        sequence_mixer=args.sequence_mixer,
+        ssm_state_dim=args.ssm_state_dim,
+        ssm_expand=args.ssm_expand,
+        ssm_dt_rank=args.ssm_dt_rank,
+        ssm_conv_width=args.ssm_conv_width,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # SSM's sequential scan loop is not compatible with fullgraph=True
+    compile_fullgraph = args.sequence_mixer != "ssm"
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=compile_fullgraph)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -896,7 +1065,9 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"sequence_mixer:{args.sequence_mixer} attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    if args.sequence_mixer == "ssm":
+        log0(f"ssm_state_dim:{args.ssm_state_dim} ssm_expand:{args.ssm_expand} ssm_dt_rank:{args.ssm_dt_rank} ssm_conv_width:{args.ssm_conv_width}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
