@@ -1007,9 +1007,11 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    # SSM's sequential scan loop is not compatible with fullgraph=True
-    compile_fullgraph = args.sequence_mixer != "ssm"
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=compile_fullgraph)
+    # SSM's sequential scan loop is not compatible with torch.compile
+    if args.sequence_mixer == "ssm":
+        compiled_model = base_model
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
