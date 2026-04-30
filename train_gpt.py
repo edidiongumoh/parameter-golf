@@ -727,21 +727,17 @@ class SelectiveSSM(nn.Module):
         bsz, seqlen, d = x.shape
         n = self.state_dim
 
-        # Cast to float32 for numerical stability in the recurrence
-        x = x.float()
-        dt = dt.float()
-        B = B.float()
-        C = C.float()
+        # Pre-allocate output tensor to avoid OOM from list of intermediates
+        y = torch.zeros(bsz, seqlen, d, device=x.device, dtype=x.dtype)
 
         # Initialize hidden state
         h = torch.zeros(bsz, d, n, device=x.device, dtype=torch.float32)
-        ys = []
 
         for t in range(seqlen):
-            dt_t = dt[:, t, :]  # (B, D)
-            x_t = x[:, t, :]   # (B, D)
-            B_t = B[:, t, :]   # (B, N)
-            C_t = C[:, t, :]   # (B, N)
+            dt_t = dt[:, t, :].float()  # (B, D)
+            x_t = x[:, t, :].float()    # (B, D)
+            B_t = B[:, t, :].float()    # (B, N)
+            C_t = C[:, t, :].float()    # (B, N)
 
             # Discretize at this timestep
             dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))  # (B, D, N)
@@ -750,12 +746,10 @@ class SelectiveSSM(nn.Module):
             # State update: h = A_bar * h + B_bar * x
             h = dA * h + dB * x_t.unsqueeze(-1)
 
-            # Output: y = C * h
-            y_t = (h * C_t.unsqueeze(1)).sum(dim=-1)  # (B, D)
-            ys.append(y_t)
+            # Output: y = C * h, write directly to pre-allocated tensor
+            y[:, t, :] = (h * C_t.unsqueeze(1)).sum(dim=-1).to(dtype=y.dtype)
 
-        y = torch.stack(ys, dim=1)  # (B, L, D)
-        return y.to(dtype=self.out_proj.weight.dtype)
+        return y
 
 
 class Block(nn.Module):
